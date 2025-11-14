@@ -40,7 +40,7 @@ impl CoinGecko {
         let ids = assets.keys().join(",");
 
         let url = format!(
-            "https://pro-api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&x_cg_pro_api_key={api_key}",
+            "https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&x_cg_demo_api_key={api_key}",
         );
 
         Self { url, update_tx, assets }

@@ -9,7 +9,7 @@ use crate::{
     estimation::fees::approx_intrinsic_cost,
     provider::ProviderExt,
     rpc::ExtraFeeInfo,
-    signers::Eip712PayLoadSigner,
+    signers::{Eip712PayLoadSigner, FunderSigner},
     storage::BundleHistoryEntry,
     transactions::{RelayTransactionKind, interop::InteropBundle},
     types::{
@@ -189,12 +189,14 @@ impl Relay {
         chains: Arc<Chains>,
         quote_signer: DynSigner,
         funder_signer: DynSigner,
+        lit_funder_signer: Option<Arc<dyn FunderSigner>>,
         quote_config: QuoteConfig,
         price_oracle: PriceOracle,
         fee_recipient: Address,
         storage: RelayStorage,
         asset_info: AssetInfoServiceHandle,
         escrow_refund_threshold: u64,
+        funder_fee_bps: u64,
     ) -> Self {
         let inner = RelayInner {
             contracts,
@@ -202,11 +204,13 @@ impl Relay {
             fee_recipient,
             quote_signer,
             funder_signer,
+            lit_funder_signer,
             quote_config,
             price_oracle,
             storage,
             asset_info,
             escrow_refund_threshold,
+            funder_fee_bps,
         };
         Self { inner: Arc::new(inner) }
     }
@@ -742,6 +746,24 @@ impl Relay {
         }
     }
 
+    async fn sign_fund_transfers(&self, intent: Intent, eip712_digest: B256) -> RpcResult<Intent> {
+        if self.inner.lit_funder_signer.is_some() {
+            // Defer signing for Lit Actions - only set funder address
+            Ok(intent.with_funder(self.contracts().funder()))
+        } else {
+            // Sign immediately with regular funder signer
+            Ok(intent
+                .with_funder_signature(
+                    self.inner
+                        .funder_signer
+                        .sign_payload_hash(eip712_digest)
+                        .await
+                        .map_err(RelayError::from)?,
+                )
+                .with_funder(self.contracts().funder()))
+        }
+    }
+
     #[instrument(skip_all)]
     async fn prepare_tx(
         &self,
@@ -770,17 +792,7 @@ impl Relay {
 
         // Sign fund transfers if any
         if !quote.intent.encoded_fund_transfers().is_empty() {
-            // Set funder contract address and sign
-            quote.intent = quote
-                .intent
-                .with_funder_signature(
-                    self.inner
-                        .funder_signer
-                        .sign_payload_hash(eip712_digest)
-                        .await
-                        .map_err(RelayError::from)?,
-                )
-                .with_funder(self.contracts().funder());
+            quote.intent = self.sign_fund_transfers(quote.intent, eip712_digest).await?;
         }
 
         // Set non-eip712 payment fields. Since they are not included into the signature so we
@@ -1634,7 +1646,7 @@ impl Relay {
                 let Some(dst_decimals) = self
                     .inner
                     .chains
-                    .asset(destination_chain_id, mapped.address)
+                    .asset(destination_chain_id, asset.address())
                     .map(|(_, desc)| desc.decimals)
                 else {
                     return true;
@@ -2036,13 +2048,13 @@ impl Relay {
                     output_quote.orchestrator,
                     requested_funds.clone(),
                     num_funding_chains + 1,
-                    // If fee_payer is specified, use the chosen fee_token
+                    // Pass the fee token so source_funds can check if it's supported for interop
                     //
                     // CAREFUL: build_fee_payer_quote depends on the following fee_token being the
                     // same across chains for now.
                     // TODO: instead, just use any and then calculate total fee on fee_token
                     // through the usd sum.
-                    request.capabilities.meta.fee_payer.and(Some(fee_token)),
+                    Some(fee_token),
                     // Fees are sponsored if fee_payer is present
                     request.capabilities.meta.fee_payer.is_some(),
                 )
@@ -3612,6 +3624,8 @@ pub(super) struct RelayInner {
     quote_signer: DynSigner,
     /// The signer used to sign fund transfers.
     funder_signer: DynSigner,
+    /// The Lit Actions funder signer for on-chain escrow verification.
+    lit_funder_signer: Option<Arc<dyn FunderSigner>>,
     /// Quote related configuration.
     quote_config: QuoteConfig,
     /// Price oracle.
@@ -3622,6 +3636,8 @@ pub(super) struct RelayInner {
     asset_info: AssetInfoServiceHandle,
     /// Escrow refund threshold in seconds
     escrow_refund_threshold: u64,
+    /// Fee in basis points to add to escrow amounts
+    funder_fee_bps: u64,
 }
 
 impl Relay {
@@ -3652,6 +3668,13 @@ impl Relay {
             .assets
             .iter()
             .map(|(asset, amount)| {
+                // Apply funder fee: escrow_amount = ceil(amount * (10000 + funder_fee_bps) / 10000)
+                let multiplier = U256::from(10000 + self.inner.funder_fee_bps);
+                let divisor = U256::from(10000);
+                let numerator = amount.saturating_mul(multiplier);
+                // Ceiling division: (numerator + divisor - 1) / divisor
+                let escrow_amount = numerator.saturating_add(divisor - U256::from(1)) / divisor;
+
                 Ok(Escrow {
                     salt,
                     depositor: context.eoa,
@@ -3661,8 +3684,8 @@ impl Relay {
                     sender: context.output_orchestrator,
                     settlementId: context.output_intent_digest,
                     senderChainId: U256::from(context.output_chain_id),
-                    escrowAmount: *amount,
-                    refundAmount: *amount,
+                    escrowAmount: escrow_amount,
+                    refundAmount: escrow_amount,
                     refundTimestamp: refund_timestamp,
                 })
             })

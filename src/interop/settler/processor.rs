@@ -148,6 +148,12 @@ impl SettlementProcessor {
             "Building settlement transactions - one per destination"
         );
 
+        // SimpleSettler needs full bundle access to build settlements, so handle it specially
+        if self.settler.id() == SettlerId::Simple {
+            return self.settler.build_execute_receive_transactions(bundle).await;
+        }
+
+        // For other settlers (LayerZero), use the standard flow
         // Get all unique source chain IDs
         let mut source_chain_set = HashSet::with_capacity(bundle.src_txs.len());
         for tx in &bundle.src_txs {
@@ -221,7 +227,8 @@ mod tests {
     async fn test_settler_id_validation_in_build_settlements() {
         // Create a settlement processor with a simple settler
         let signer = B256::random().to_string().parse::<PrivateKeySigner>().unwrap();
-        let settler = Box::new(SimpleSettler::new(signer, Default::default()));
+        let settler =
+            Box::new(SimpleSettler::new(signer, Default::default(), Default::default()));
         let processor = SettlementProcessor::new(settler);
 
         // Create a bundle with a different settler ID

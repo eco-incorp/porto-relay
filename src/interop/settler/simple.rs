@@ -23,17 +23,31 @@ pub struct SimpleSettler {
     signer: PrivateKeySigner,
     /// Providers for each chain
     providers: HashMap<ChainId, DynProvider>,
+    /// Settler addresses for each chain
+    settler_addresses: HashMap<ChainId, Address>,
 }
 
 impl SimpleSettler {
     /// Creates a new simple settler instance
-    pub fn new(signer: PrivateKeySigner, providers: HashMap<ChainId, DynProvider>) -> Self {
-        Self { signer, providers }
+    pub fn new(
+        signer: PrivateKeySigner,
+        providers: HashMap<ChainId, DynProvider>,
+        settler_addresses: HashMap<ChainId, Address>,
+    ) -> Self {
+        Self { signer, providers, settler_addresses }
     }
 
     /// Gets a provider for the specified chain
     fn provider(&self, chain_id: ChainId) -> Result<&DynProvider, SettlementError> {
         self.providers.get(&chain_id).ok_or(SettlementError::UnsupportedChain(chain_id))
+    }
+
+    /// Gets the settler address for the specified chain
+    fn settler_address(&self, chain_id: ChainId) -> Result<Address, SettlementError> {
+        self.settler_addresses
+            .get(&chain_id)
+            .copied()
+            .ok_or(SettlementError::MissingSettlerAddress(chain_id))
     }
 
     /// Fetches the EIP712 domain from the SimpleSettler contract
@@ -170,16 +184,17 @@ impl Settler for SimpleSettler {
             let destination_chain = dst_tx.chain_id();
             let quote = dst_tx.quote().ok_or(SettlementError::MissingIntent)?;
             let sender = quote.orchestrator;
-            let intent_settler = quote.intent.settler();
 
             let txs = try_join_all(source_chains.iter().map(async |&source_chain| {
+                let source_settler_address = self.settler_address(source_chain)?;
+
                 let write_calldata = self
                     .build_write_calldata(
                         sender,
                         settlement_id,
                         destination_chain,
                         source_chain,
-                        intent_settler,
+                        source_settler_address,
                     )
                     .await?;
 
@@ -190,13 +205,26 @@ impl Settler for SimpleSettler {
                     write_calldata,
                     settle_calldata,
                     escrow_address,
-                    intent_settler,
+                    source_settler_address,
                 );
 
                 let tx_request = TransactionRequest::default()
                     .to(MULTICALL3_ADDRESS)
                     .input(multicall_data.clone().into());
-                let gas_limit = self.provider(source_chain)?.estimate_gas(tx_request).await?;
+
+                let gas_limit = match self.provider(source_chain)?.estimate_gas(tx_request).await {
+                    Ok(gas) => gas,
+                    Err(e) => {
+                        tracing::warn!(
+                            source_chain = source_chain,
+                            settlement_id = ?settlement_id,
+                            error = ?e,
+                            "Gas estimation failed for settlement transaction, using default gas limit"
+                        );
+                        // Use a generous default gas limit (500k should be enough for write + settle)
+                        500_000
+                    }
+                };
 
                 Ok::<_, SettlementError>(RelayTransaction::new_internal(
                     MULTICALL3_ADDRESS,

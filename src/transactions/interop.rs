@@ -15,7 +15,7 @@ use crate::{
     types::{
         InteropTransactionBatch,
         OrchestratorContract::IntentExecuted,
-        TransactionServiceHandles,
+        TransactionServiceHandles, Transfer,
         rpc::{BundleId, CallStatusCode},
     },
 };
@@ -455,6 +455,7 @@ struct InteropServiceInner {
     refund_processor: RefundProcessor,
     settlement_processor: Arc<SettlementProcessor>,
     interop_config: InteropConfig,
+    lit_funder_signer: Option<Arc<dyn crate::signers::FunderSigner>>,
 }
 
 impl InteropServiceInner {
@@ -466,6 +467,7 @@ impl InteropServiceInner {
         providers: HashMap<ChainId, DynProvider>,
         settlement_processor: Arc<SettlementProcessor>,
         interop_config: InteropConfig,
+        lit_funder_signer: Option<Arc<dyn crate::signers::FunderSigner>>,
     ) -> Self {
         let refund_processor = RefundProcessor::new(storage.clone(), providers);
         Self {
@@ -475,6 +477,7 @@ impl InteropServiceInner {
             refund_processor,
             settlement_processor,
             interop_config,
+            lit_funder_signer,
         }
     }
 
@@ -608,7 +611,11 @@ impl InteropServiceInner {
     ) -> Result<(), InteropBundleError> {
         tracing::info!(bundle_id = ?bundle.bundle.id, "Sending destination transactions");
 
-        // Queue and send destination transactions
+        if let Some(lit_signer) = &self.lit_funder_signer {
+            bundle.bundle.dst_txs =
+                self.sign_transactions_with_lit(lit_signer, &bundle.bundle).await?;
+        }
+
         bundle.status = self
             .queue_and_send_bundle_transactions(
                 bundle,
@@ -617,6 +624,125 @@ impl InteropServiceInner {
             .await?;
 
         Ok(())
+    }
+
+    async fn sign_transactions_with_lit(
+        &self,
+        lit_signer: &Arc<dyn crate::signers::FunderSigner>,
+        bundle: &InteropBundle,
+    ) -> Result<Vec<RelayTransaction>, InteropBundleError> {
+        tracing::info!(
+            bundle_id = ?bundle.id,
+            dst_count = bundle.dst_txs.len(),
+            "Generating funder signatures via Lit Actions"
+        );
+
+        let escrow_and_chain_ids = Self::extract_escrow_details_from_sources(&bundle.src_txs);
+
+        let signed_txs = try_join_all(
+            bundle
+                .dst_txs
+                .iter()
+                .map(|tx| self.sign_transaction_if_needed(tx, lit_signer, &escrow_and_chain_ids)),
+        )
+        .await?;
+
+        tracing::info!(
+            bundle_id = ?bundle.id,
+            "Funder signatures generated successfully"
+        );
+
+        Ok(signed_txs)
+    }
+
+    fn extract_escrow_details_from_sources(src_txs: &[RelayTransaction]) -> Vec<(B256, ChainId)> {
+        src_txs
+            .iter()
+            .filter_map(|tx| tx.extract_escrow_details())
+            .flatten()
+            .map(|detail| (detail.escrow_id, detail.chain_id))
+            .collect()
+    }
+
+    async fn sign_transaction_if_needed(
+        &self,
+        tx: &RelayTransaction,
+        lit_signer: &Arc<dyn crate::signers::FunderSigner>,
+        escrow_and_chain_ids: &[(B256, ChainId)],
+    ) -> Result<RelayTransaction, InteropBundleError> {
+        let quote = if let Some(quote) = tx.quote() {
+            quote
+        } else {
+            return Ok(tx.clone());
+        };
+
+        let fund_transfers = quote.intent.fund_transfers().map_err(|e| {
+            tracing::error!(tx_id = ?tx.id, error = ?e, "Failed to extract fund transfers");
+            InteropBundleError::AbiError(e)
+        })?;
+
+        if fund_transfers.is_empty() {
+            return Ok(tx.clone());
+        }
+
+        let intent_digest = if let Some(digest) = tx.eip712_digest() {
+            digest
+        } else {
+            return Ok(tx.clone());
+        };
+
+        let transfers: Vec<_> =
+            fund_transfers.into_iter().map(|(token, amount)| Transfer { token, amount }).collect();
+        let destination_chain_id = tx.chain_id();
+
+        tracing::debug!(
+            tx_id = ?tx.id,
+            transfer_count = transfers.len(),
+            escrow_count = escrow_and_chain_ids.len(),
+            destination_chain = destination_chain_id,
+            "Signing fund transfers via Lit Actions"
+        );
+
+        let signature = lit_signer
+            .sign_funding_request(
+                intent_digest,
+                transfers,
+                escrow_and_chain_ids.to_vec(),
+                destination_chain_id,
+            )
+            .await
+            .map_err(|e| {
+                InteropBundleError::AbiError(alloy::sol_types::Error::Other(Cow::Owned(format!(
+                    "Failed to sign fund transfer: {e}"
+                ))))
+            })?;
+
+        Ok(Self::create_signed_transaction(tx, quote, signature, intent_digest))
+    }
+
+    fn create_signed_transaction(
+        tx: &RelayTransaction,
+        quote: &crate::types::Quote,
+        signature: Bytes,
+        intent_digest: B256,
+    ) -> RelayTransaction {
+        let mut quote = quote.clone();
+        quote.intent = quote.intent.clone().with_funder_signature(signature);
+
+        let authorization_list = match &tx.kind {
+            super::RelayTransactionKind::Intent { authorization_list, .. } => {
+                authorization_list.clone()
+            }
+            _ => vec![],
+        };
+
+        let mut signed_tx = super::RelayTransaction::new(quote, authorization_list, intent_digest);
+
+        signed_tx.id = tx.id;
+        signed_tx.trace_context = tx.trace_context.clone();
+        signed_tx.received_at = tx.received_at;
+
+        signed_tx
     }
 
     /// Handle bundles with source failures - schedule refunds for any successful source
@@ -1262,6 +1388,8 @@ impl InteropService {
         tx_service_handles: HashMap<ChainId, TransactionServiceHandle>,
         liquidity_tracker: LiquidityTracker,
         interop_config: InteropConfig,
+        lit_funder_signer: Option<std::sync::Arc<dyn crate::signers::FunderSigner>>,
+        chains: &HashMap<ChainId, crate::chains::Chain>,
     ) -> eyre::Result<(Self, InteropServiceHandle)> {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
@@ -1275,6 +1403,7 @@ impl InteropService {
                     storage.clone(),
                     providers.clone(),
                     TransactionServiceHandles::new(tx_service_handles.clone()),
+                    chains,
                 )
                 .await?,
         );
@@ -1287,6 +1416,7 @@ impl InteropService {
                 providers,
                 Arc::clone(&settlement_processor),
                 interop_config.clone(),
+                lit_funder_signer,
             )),
             command_rx,
         };
@@ -1576,6 +1706,7 @@ mod tests {
             InteropConfig {
                 refund_check_interval: Duration::from_secs(60),
                 escrow_refund_threshold: 300,
+                funder_fee_bps: 0,
                 settler: SettlerConfig {
                     implementation: SettlerImplementation::Simple(SimpleSettlerConfig {
                         private_key: Some(B256::random().to_string()),
@@ -1583,6 +1714,7 @@ mod tests {
                     wait_verification_timeout: Duration::from_secs(1),
                 },
             },
+            None,
         );
 
         let bundle_id = BundleId::random();

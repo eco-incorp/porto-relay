@@ -211,6 +211,7 @@ impl Chains {
         storage: RelayStorage,
         config: &RelayConfig,
         asset_info: AssetInfoServiceHandle,
+        lit_funder_signer: Option<std::sync::Arc<dyn crate::signers::FunderSigner>>,
     ) -> eyre::Result<Self> {
         let chains = HashMap::from_iter(
             futures_util::future::try_join_all(config.chains.iter().map(async |(chain, desc)| {
@@ -354,9 +355,14 @@ impl Chains {
 
         // Create and spawn the interop service if configured
         let interop = if let Some(interop_config) = &config.interop {
-            let (interop_service, interop_handle) =
-                InteropService::new(tx_handles, liquidity_tracker.clone(), interop_config.clone())
-                    .await?;
+            let (interop_service, interop_handle) = InteropService::new(
+                tx_handles,
+                liquidity_tracker.clone(),
+                interop_config.clone(),
+                lit_funder_signer,
+                &chains,
+            )
+            .await?;
 
             tokio::spawn(interop_service);
             Some(interop_handle)

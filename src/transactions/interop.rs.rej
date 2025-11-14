@@ -1,0 +1,10 @@
+diff a/src/transactions/interop.rs b/src/transactions/interop.rs	(rejected hunks)
+@@ -15,7 +15,7 @@ use crate::{
+     types::{
+         InteropTransactionBatch,
+         OrchestratorContract::IntentExecuted,
+-        TransactionServiceHandles,
++        TransactionServiceHandles, Transfer,
+         rpc::{BundleId, CallStatusCode},
+     },
+ };

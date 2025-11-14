@@ -58,6 +58,9 @@ pub struct RelayConfig {
     /// Phone configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone: Option<PhoneConfig>,
+    /// Lit Actions configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lit_actions: Option<LitActionsConfig>,
     /// Transaction service configuration.
     #[serde(default)]
     pub transactions: TransactionServiceConfig,
@@ -707,13 +710,23 @@ const fn default_rpc_timeout_secs() -> u64 {
     10
 }
 
+/// Lit Actions configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LitActionsConfig {
+    /// Lit Actions endpoint URL.
+    pub endpoint: Url,
+    /// Lit Actions IPFS CID.
+    pub ipfs_cid: String,
+}
+
 /// Secrets (kept out of serialized output).
 #[derive(Debug, Clone, Deserialize)]
 pub struct SecretsConfig {
     /// The secret key to sign transactions with.
     #[serde(with = "alloy::serde::displayfromstr")]
     pub signers_mnemonic: Mnemonic<English>,
-    /// The funder KMS key or private key
+    /// The funder KMS key or private key (also used as Lit PKP private key)
     pub funder_key: String,
     /// API key for protected RPC endpoints
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -746,6 +759,11 @@ pub struct InteropConfig {
     pub refund_check_interval: Duration,
     /// Time threshold in seconds before refunds can be processed for escrows.
     pub escrow_refund_threshold: u64,
+    /// Fee in basis points (bps) to add to escrow amounts for funder profit.
+    /// For example, 50 bps = 0.5% markup.
+    /// escrow_amount = ceil(transfer_amount * (10000 + funder_fee_bps) / 10000)
+    #[serde(default)]
+    pub funder_fee_bps: u64,
     /// Settler configuration.
     pub settler: SettlerConfig,
 }
@@ -801,13 +819,27 @@ impl SettlerConfig {
         storage: RelayStorage,
         providers: alloy::primitives::map::HashMap<ChainId, DynProvider>,
         tx_service_handles: TransactionServiceHandles,
+        chains: &HashMap<ChainId, crate::chains::Chain>,
     ) -> eyre::Result<SettlementProcessor> {
         // Create the settler based on config
         let settler: Box<dyn Settler> = match &self.implementation {
             SettlerImplementation::LayerZero(config) => Box::new(
                 config.create_settler(providers, storage.clone(), tx_service_handles).await?,
             ),
-            SettlerImplementation::Simple(config) => Box::new(config.create_settler(providers)?),
+            SettlerImplementation::Simple(config) => {
+                // Extract settler addresses from chains for all provider chain IDs
+                let settler_addresses: HashMap<ChainId, Address> = providers
+                    .keys()
+                    .filter_map(|chain_id| {
+                        chains
+                            .get(chain_id)
+                            .and_then(|chain| chain.settler_address())
+                            .map(|addr| (*chain_id, addr))
+                    })
+                    .collect();
+
+                Box::new(config.create_settler(providers, settler_addresses)?)
+            }
         };
 
         Ok(SettlementProcessor::new(settler))
@@ -837,6 +869,7 @@ impl SimpleSettlerConfig {
     pub fn create_settler(
         &self,
         providers: HashMap<ChainId, DynProvider>,
+        settler_addresses: HashMap<ChainId, Address>,
     ) -> eyre::Result<SimpleSettler> {
         let signer = self
             .private_key
@@ -845,7 +878,7 @@ impl SimpleSettlerConfig {
             .parse::<PrivateKeySigner>()
             .map_err(|e| eyre::eyre!("Invalid private key: {}", e))?;
 
-        Ok(SimpleSettler::new(signer, providers))
+        Ok(SimpleSettler::new(signer, providers, settler_addresses))
     }
 }
 

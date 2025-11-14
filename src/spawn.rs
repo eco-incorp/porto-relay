@@ -132,9 +132,29 @@ pub async fn try_spawn(config: RelayConfig, skip_diagnostics: bool) -> eyre::Res
     let asset_info_handle = asset_info.handle();
     tokio::spawn(asset_info);
 
+    let lit_funder_signer = config
+        .lit_actions
+        .as_ref()
+        .map(|lit_config| -> eyre::Result<_> {
+            info!("Initializing Lit Actions funder signer with endpoint: {}", lit_config.endpoint);
+            Ok(Arc::new(crate::signers::LitFunderSigner::new(
+                lit_config.endpoint.clone(),
+                lit_config.ipfs_cid.clone(),
+            )) as Arc<dyn crate::signers::FunderSigner>)
+        })
+        .transpose()?;
+
     // build chains
-    let chains =
-        Arc::new(Chains::new(signers, storage.clone(), &config, asset_info_handle.clone()).await?);
+    let chains = Arc::new(
+        Chains::new(
+            signers,
+            storage.clone(),
+            &config,
+            asset_info_handle.clone(),
+            lit_funder_signer.clone(),
+        )
+        .await?,
+    );
 
     // Run pre-flight diagnostics
     if skip_diagnostics {
@@ -183,6 +203,7 @@ pub async fn try_spawn(config: RelayConfig, skip_diagnostics: bool) -> eyre::Res
         chains.clone(),
         quote_signer,
         funder_signer.clone(),
+        lit_funder_signer,
         config.quote,
         price_oracle.clone(),
         config.fee_recipient,
@@ -193,6 +214,7 @@ pub async fn try_spawn(config: RelayConfig, skip_diagnostics: bool) -> eyre::Res
             .as_ref()
             .map(|i| i.escrow_refund_threshold)
             .unwrap_or(ESCROW_REFUND_DURATION_SECS),
+        config.interop.as_ref().map(|i| i.funder_fee_bps).unwrap_or(0),
     );
     // Setup account RPC module if email and onramp worker secret are configured
     let account_rpc = if let (Some(resend_api_key), Some(onramp_worker_secret)) =
