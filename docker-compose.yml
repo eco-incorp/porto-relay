@@ -1,0 +1,77 @@
+services:
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BUILD_PROFILE: maxperf
+    image: porto-relay:latest
+    container_name: porto-relay
+    restart: unless-stopped
+    ports:
+      - "9119:9119" # RPC server port
+      - "9000:9000" # Metrics port
+    volumes:
+      - ./relay.yaml:/app/relay.yaml:ro
+    environment:
+      # CoinGecko API key for price feeds
+      GECKO_API: ${GECKO_API:-YOUR_COINGECKO_API_KEY}
+      # Relay signer mnemonic
+      RELAY_MNEMONIC: ${RELAY_MNEMONIC:-YOUR_RELAY_MNEMONIC}
+      # Funder signer private key
+      RELAY_FUNDER_SIGNER_KEY: ${RELAY_FUNDER_SIGNER_KEY:-YOUR_FUNDER_SIGNER_KEY}
+      # Settler signer private key
+      RELAY_SETTLER_SIGNER_KEY: ${RELAY_SETTLER_SIGNER_KEY:-YOUR_SETTLER_SIGNER_KEY}
+      # Rust logging level (trace, debug, info, warn, error)
+      RUST_LOG: ${RUST_LOG:-info}
+    command: >
+      --config-only
+      --config /app/relay.yaml
+      --skip-diagnostics
+    networks:
+      - porto-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9119/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      lit-server:
+        condition: service_healthy
+
+  lit-server:
+    build:
+      context: ./lit-server
+      dockerfile: Dockerfile
+    image: porto-lit-server:latest
+    container_name: porto-lit-server
+    restart: unless-stopped
+    ports:
+      - "3050:3050" # Lit Actions HTTP server port
+    environment:
+      # Lit Protocol Configuration
+      PKP_PUBLIC_KEY: ${PKP_PUBLIC_KEY:-0477a05819c5ebbc5afd9fb799ff0ffb4fac069ad82bc267abe494f2524cd84e4c88f52f8829b7d037495be13164074158773af918288da14a22ed0d2d83ca1e1e}
+      PKP_WALLET_OWNER_PRIVATE_KEY: ${PKP_WALLET_OWNER_PRIVATE_KEY:-YOUR_PKP_WALLET_OWNER_PRIVATE_KEY}
+      # Server Configuration
+      PORT: 3050
+    networks:
+      - porto-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://localhost:3050/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+networks:
+  porto-network:
+    driver: bridge

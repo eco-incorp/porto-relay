@@ -13,11 +13,11 @@ COPY --from=planner /app/recipe.json recipe.json
 
 # Build profile, maxperf by default
 ARG BUILD_PROFILE=maxperf
-ENV BUILD_PROFILE $BUILD_PROFILE
+ENV BUILD_PROFILE=$BUILD_PROFILE
 
 # Extra Cargo features
 ARG FEATURES=""
-ENV FEATURES $FEATURES
+ENV FEATURES=$FEATURES
 
 # Install system dependencies
 RUN apt-get update && apt-get -y upgrade && apt-get install -y libclang-dev pkg-config
